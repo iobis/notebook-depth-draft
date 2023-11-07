@@ -1,0 +1,66 @@
+---
+title: Depth distribution of OBIS records
+date: "`r Sys.Date()`"
+author: Pieter Provoost
+output: (function(...) {
+  rmdformats::robobook(toc_depth = 4, pandoc_args = c("+RTS", "-K2000m", "-RTS"), ...) })
+editor_options: 
+  chunk_output_type: console
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "docs") })  
+---
+
+```{r message=FALSE, warning=FALSE}
+library(arrow)
+library(dplyr)
+library(stars)
+library(units)
+library(ggplot2)
+library(glue)
+library(scales)
+
+space <- S3FileSystem$create(
+  anonymous = TRUE,
+  scheme = "https",
+  endpoint_override = "ams3.digitaloceanspaces.com"
+)
+
+#occ <- open_dataset(space$path("obis-datasets/exports/obis_20220221.parquet")) %>%
+occ <- open_dataset("/Users/pieter/Downloads/obis_20221006.parquet") %>%
+  select(minimumDepthInMeters, maximumDepthInMeters, year = date_year) %>%
+  mutate(minimumDepthInMeters = as.numeric(minimumDepthInMeters), maximumDepthInMeters = as.numeric(maximumDepthInMeters)) %>%
+  as_tibble()
+
+occ$depth <- - rowMeans(occ[,c("minimumDepthInMeters", "maximumDepthInMeters")], na.rm = TRUE)
+
+occ <- occ %>%
+  filter(!is.nan(depth) & !is.na(year) & depth <= 0 & depth > -11000 & year >= 1800 & year < 2030) %>%
+  select(depth, year)
+
+depth_breaks <- c(seq(0, -200, by = -10), seq(-300, -1000, by = -100), seq(-2000, -11000, by = -1000))
+year_breaks <- seq(1800, 2020, by = 10)
+
+occ$depth_bin <- cut(occ$depth, breaks = depth_breaks, dig.lab = 10, right = TRUE)
+occ$year_bin <- cut(occ$year, breaks = year_breaks, dig.lab = 10, right = FALSE)
+
+stats <- occ %>%
+  group_by(depth_bin, year_bin) %>%
+  summarize(records = n())
+
+stats$depth_start <- rev(depth_breaks)[stats$depth_bin]
+stats$depth_end <- rev(depth_breaks)[as.numeric(stats$depth_bin) + 1]
+stats$year_start <- year_breaks[stats$year_bin]
+stats$year_end <- year_breaks[as.numeric(stats$year_bin) + 1]
+
+reverselog_trans <- function() {
+  trans <- function(x) -log10(x)
+  inv <- function(x) 10^(-x)
+  trans_new("revlog", trans, inv, log_breaks(base = 10), domain = c(1e-100, Inf))
+}
+
+ggplot() +
+  geom_rect(data = stats, mapping = aes(xmin = year_start, xmax = year_end, ymin = -depth_start, ymax = -depth_end, fill = records)) +
+  scale_fill_continuous(trans = "log10") +
+  scale_y_continuous(trans = reverselog_trans())
+```
+

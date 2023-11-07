@@ -1,0 +1,184 @@
+---
+title: Depth distribution of OBIS records
+date: "`r Sys.Date()`"
+author: Pieter Provoost
+output: (function(...) {
+  rmdformats::robobook(toc_depth = 4, pandoc_args = c("+RTS", "-K2000m", "-RTS"), ...) })
+editor_options: 
+  chunk_output_type: console
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "docs") })  
+---
+
+## Dependencies
+
+```{r message=FALSE, warning=FALSE}
+library(arrow)
+library(dplyr)
+library(stars)
+library(units)
+library(ggplot2)
+library(glue)
+library(scales)
+library(viridis)
+```
+
+## Calculate volume by depth zone: example
+
+First download GEBCO GeoTiff data to `data/gebco_2021_sub_ice_topo_geotiff` and retile using `retile.sh``.
+
+```{r message=FALSE, warning=FALSE}
+gebco_files <- list.files("data/gebco_merged", pattern = "*_resampled_01.tif", full.names = TRUE)
+
+dem <- stars::read_stars(gebco_files[1], proxy = FALSE)
+names(dem) = "depth"
+dem[["depth"]] <- as_units(dem[["depth"]], "m")
+
+plot(dem, col = hcl.colors(11, "Spectral"), downsample = 0)
+```
+
+To calculate the water volume for a specific depth zone, restrict the DEM to values lower than or equal to the upper depth limit, then calculate the water column between the limits, and multiply with the surface area.
+
+For example, for a depth zone between 2000 and 3000 meters:
+
+```{r message=FALSE, warning=FALSE}
+layer_top <- as_units(-2000, "m")
+layer_bottom <- as_units(-3000, "m")
+layer_height <- layer_top - layer_bottom
+
+zone <- dem
+zone[["depth"]][zone[["depth"]] > layer_top] <- as_units(NA, "m")
+
+plot(zone, col = hcl.colors(11, "Spectral"), downsample = 0)
+```
+
+```{r message=FALSE, warning=FALSE}
+zone$height <- layer_top - zone[["depth"]]
+zone$height[zone$height > layer_height] <- layer_height
+
+# stars bug?
+# plot(st_downsample(zone, 20), attr = 2, col = hcl.colors(11, "Spectral"))
+
+ggplot() +
+  geom_stars(data = zone, aes(x, y, fill = height), downsample = 1) +
+  scale_fill_distiller(palette = "Spectral", na.value = "#ffffff") +
+  coord_sf()
+```
+
+Not sure how to calculate surface area with `stars`, move to `sf` for the remainder.
+
+```{r message=FALSE, warning=FALSE}
+zone_sf <- st_as_sf(zone, as_points = FALSE)
+zone_sf$area <- st_area(zone_sf)
+zone_sf$volume <- zone_sf$area * zone_sf$height
+```
+
+## Calculate volume for all depth zones
+
+```{r message=FALSE, warning=FALSE}
+depth_breaks <- c(seq(0, -200, by = -10), seq(-300, -1000, by = -100), seq(-2000, -11000, by = -1000))
+
+results <- tibble()
+
+for (i in 1:length(depth_breaks)) {
+  layer_top <- as_units(depth_breaks[i], "m")
+  layer_bottom <- as_units(depth_breaks[i + 1], "m")
+  message(glue("{layer_top} -> {layer_bottom}"))
+  layer_height <- layer_top - layer_bottom
+  zone <- dem
+  zone[["depth"]][zone[["depth"]] > layer_top] <- as_units(NA, "m")
+  zone$height <- layer_top - zone[["depth"]]
+  zone$height[zone$height > layer_height] <- layer_height
+  zone_sf <- st_as_sf(zone, as_points = FALSE)
+  remove(zone)
+  zone_sf$area <- st_area(zone_sf)
+  zone_sf$volume <- zone_sf$area * zone_sf$height
+  results <- bind_rows(results, tibble(
+    top = drop_units(layer_top),
+    bottom = drop_units(layer_bottom),
+    volume = sum(zone_sf$volume)
+  ))
+}
+```
+
+## Fetch OBIS data
+
+```{r message=FALSE, warning=FALSE}
+space <- S3FileSystem$create(
+  anonymous = TRUE,
+  scheme = "https",
+  endpoint_override = "ams3.digitaloceanspaces.com"
+)
+
+#occ <- open_dataset(space$path("obis-datasets/exports/obis_20220221.parquet")) %>%
+occ <- open_dataset("/Users/pieter/Downloads/obis_20221006.parquet") %>%
+  select(minimumDepthInMeters, maximumDepthInMeters, year = date_year) %>%
+  mutate(minimumDepthInMeters = as.numeric(minimumDepthInMeters), maximumDepthInMeters = as.numeric(maximumDepthInMeters)) %>%
+  as_tibble()
+
+occ$depth <- - rowMeans(occ[,c("minimumDepthInMeters", "maximumDepthInMeters")], na.rm = TRUE)
+
+occ <- occ %>%
+  filter(!is.nan(depth) & !is.na(year) & depth <= 0 & depth > -11000 & year >= 1800 & year < 2030) %>%
+  select(depth, year)
+
+depth_breaks <- c(seq(0, -200, by = -10), seq(-300, -1000, by = -100), seq(-2000, -11000, by = -1000))
+year_breaks <- seq(1800, 2020, by = 10)
+
+occ$depth_bin <- cut(occ$depth, breaks = depth_breaks, dig.lab = 10, right = TRUE)
+occ$year_bin <- cut(occ$year, breaks = year_breaks, dig.lab = 10, right = FALSE)
+
+stats <- occ %>%
+  group_by(depth_bin, year_bin) %>%
+  summarize(records = n())
+
+stats$depth_start <- rev(depth_breaks)[stats$depth_bin]
+stats$depth_end <- rev(depth_breaks)[as.numeric(stats$depth_bin) + 1]
+stats$year_start <- year_breaks[stats$year_bin]
+stats$year_end <- year_breaks[as.numeric(stats$year_bin) + 1]
+
+reverselog_trans <- function() {
+  trans <- function(x) -log10(x)
+  inv <- function(x) 10^(-x)
+  trans_new("revlog", trans, inv, log_breaks(base = 10), domain = c(1e-100, Inf))
+}
+
+ggplot() +
+  geom_rect(data = stats, mapping = aes(xmin = year_start, xmax = year_end, ymin = -depth_start, ymax = -depth_end, fill = records)) +
+  scale_fill_continuous(trans = "log10") +
+  scale_y_continuous(trans = reverselog_trans())
+```
+
+```{r message=FALSE, warning=FALSE}
+stats <- stats %>%
+  left_join(results, by = c("depth_start" = "bottom", "depth_end" = "top")) %>%
+  mutate(volume = volume / 1000000000) %>% # km3
+  mutate(records = records / drop_units(volume))
+
+ggplot() +
+  geom_rect(data = stats, mapping = aes(xmin = year_start, xmax = year_end, ymin = -depth_start, ymax = -depth_end, fill = records)) +
+  scale_fill_viridis(trans = "log10", option = "mako", direction = -1) +
+  scale_y_continuous(trans = reverselog_trans()) +
+  labs(fill = "Records per cubic km") +
+  geom_hline(yintercept = 200, linetype = "dashed") +
+  geom_hline(yintercept = 1000, linetype = "dashed") +
+  geom_hline(yintercept = 4000, linetype = "dashed") +
+  geom_hline(yintercept = 6000, linetype = "dashed") +
+  geom_hline(yintercept = 11000, linetype = "dashed") +
+  annotate(geom = "text", x = 1800, y = 200, label = "epipelagic", vjust = -1, hjust = 0) +
+  annotate(geom = "text", x = 1800, y = 1000, label = "mesopelagic", vjust = -1, hjust = 0) +
+  annotate(geom = "text", x = 1800, y = 4000, label = "bathypelagic", vjust = -1, hjust = 0) +
+  annotate(geom = "text", x = 1800, y = 6000, label = "abyssopelagic", vjust = -1, hjust = 0) +
+  annotate(geom = "text", x = 1800, y = 11000, label = "hadopelagic", vjust = -1, hjust = 0) +
+  xlab("year") +
+  ylab("depth")
+
+ggsave("depth.png", width = 12, height = 7, scale = 1)
+```
+
+
+
+
+
+
+
